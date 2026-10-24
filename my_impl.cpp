@@ -43,7 +43,8 @@ static int set_nonblocking(int fd){
 static void configure_client_socket(int fd){
     set_nonblocking(fd);
     int flag = 1; // enable flag
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)); // Need to disable Nagle's algorithm which buffers outgoing packets, creating artificial delays for small HTTP payloads 
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)); // Need to disable Nagle's algorithm which buffers outgoing packets, creating artificial delays for small HTTP payloads.
+    // Read MAN pages to know the function signature (IMPORTANT!!).
 }
 
 /* note: Need to remember 3 important epoll functions:
@@ -142,5 +143,45 @@ private:
     }
 };
 
-class ListenerThread{}; // connection accepting thread
+class ListenerThread{
+public:
+    int listen_fd{-1};
+    std::thread thread_handle;
+    std::vector<WorkerThread>* workers{nullptr};
+
+    void init(int port, std::vector<WorkerThread>* worker_pool){
+        workers = worker_pool;
+        listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if(listen_fd<0){
+            perror("socket creation failed");
+            exit(EXIT_FAILURE);
+        }
+
+        int opt = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // allow the server to reuse the port, immediately after restart (if any).
+        // Typically, The kernel waits 1-2 minutes before it frees a port (address) for use in the TIME_WAIT state to catch lingering packets.
+        // We have disabled this behaviour above.
+
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = 0; // all interfaces (0.0.0.0).
+        address.sin_port = htons(port);
+
+        if(bind(listen_fd, (struct sockaddr*)&address, sizeof(address)) < 0){
+            perror("bind failed");
+            exit(EXIT_FAILURE);
+        }
+
+        if(listen(listen_fd, Config::BACKLOG) < 0){
+            perror("Listen failed");
+            exit(EXIT_FAILURE);
+        }
+        
+        void start(){
+            thread_handle = std::thread(&ListenerThread::run, this);
+        }
+    }
+}; // connection accepting thread
 int main(){return 0;}
