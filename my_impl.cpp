@@ -183,5 +183,40 @@ public:
             thread_handle = std::thread(&ListenerThread::run, this);
         }
     }
+
+private:
+    void run(){
+        int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = listen_fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
+
+        std::vector<epoll_event> events(64);
+        size_t next_worker = 0;
+
+        while(running.load(std::memory_order_relaxed)){
+            int nfds = epoll_wait(epoll_fd, events.data(), event.size(), 100);
+            for(int i = 0; i < nfds; i++){
+                if(events[i].data.fd == listen_fd){
+                    while(true){
+                        sockaddr_in client_addr{};
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = accept4(listen_fd, (struct sockaddr*)&client_addr, &client_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                        if (client_fd < 0){
+                            break;
+                        }
+
+                        configure_client_socket(client_fd);
+                        metrics.active_connections.fetch_add(1, std::memory_order_relaxed);
+
+                        (*workers)[next_worker].add_client(client_fd);
+                        next_worker = (next_worker + 1) % workers->size();
+                    }
+                }
+            }
+        }
+        close(epoll_fd);
+    }
 }; // connection accepting thread
 int main(){return 0;}
