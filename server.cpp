@@ -1,9 +1,17 @@
 #include <iostream>
 #include <atomic>
 #include <chrono>
+#include <thread>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/epoll.h>
+#include <csignal>
 #include <cstdio>
 
 namespace Config{
@@ -53,6 +61,7 @@ static void configure_client_socket(int fd){
 3. epoll_ctl() - adds, updates, or deletes sockets
 */
 class WorkerThread{
+public:
     int epoll_fd{-1};
     std::thread thread_handle;
 
@@ -85,7 +94,7 @@ private:
             if (nfds <= 0) continue;
             // if epoll_wait returns value > 0 (say x), it means only x events have been populated by the kernel.
             for(int i = 0; i<nfds; i++){
-                int client_fd = events[i].data.fs;
+                int client_fd = events[i].data.fd;
                 uint32_t ev_mask = events[i].events;
 
                 if (ev_mask & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)){
@@ -178,10 +187,10 @@ public:
             perror("Listen failed");
             exit(EXIT_FAILURE);
         }
+    }
         
-        void start(){
-            thread_handle = std::thread(&ListenerThread::run, this);
-        }
+    void start(){
+        thread_handle = std::thread(&ListenerThread::run, this);
     }
 
 private:
@@ -196,7 +205,7 @@ private:
         size_t next_worker = 0;
 
         while(running.load(std::memory_order_relaxed)){
-            int nfds = epoll_wait(epoll_fd, events.data(), event.size(), 100);
+            int nfds = epoll_wait(epoll_fd, events.data(), events.size(), 100);
             for(int i = 0; i < nfds; i++){
                 if(events[i].data.fd == listen_fd){
                     while(true){
@@ -219,4 +228,67 @@ private:
         close(epoll_fd);
     }
 }; // connection accepting thread
-int main(){return 0;}
+
+int main(){
+    signal(SIGPIPE, SIG_IGN); // important (and standard). SIGPIPE is sent when we write to a client socket who has closed.
+                              // SIG_IGN will ignore the signal so that our program will not terminate from just 1 client socket closing off.
+                              // Otherwise, the entire program will terminate upon one client disconnecting.
+    metrics.start_time =  std::chrono::steady_clock::now();
+
+    // Initialize the 5 worker threads
+    std::vector<WorkerThread> workers(Config::NUM_WORKERS);
+    for(int i = 0; i<Config::NUM_WORKERS; i++){
+        workers[i].init();
+        workers[i].start();
+    }
+
+    // Initialize 1 listener thread
+    ListenerThread listener;
+    listener.init(Config::PORT, &workers);
+    listener.start();
+
+    std::cout<<"HTTP server is listening on port: "<<Config::PORT<<"\n";
+    std::cout<<"Threads: 1 Main (For CLI), 1 Listener, and 5 Worker threads\n";
+    std::cout<<"Command list: 'stats', 'reset', 'quit (or exit)'\n"<<std::endl;
+    
+    // Main thread management
+    std::string command;
+    while(running == true){
+        std::cout << "server> "<<std::flush;
+        if(!std::getline(std::cin, command)) break;
+        
+        if(command == "quit" || command == "exit"){
+            running = false;
+            break;
+        }
+        else if(command == "stats"){
+            auto now = std::chrono::steady_clock::now();
+            double uptime = std::chrono::duration<double>(now - metrics.start_time).count();
+            double avg_req_per_sec = (uptime > 0.0)? (metrics.total_requests/uptime) : 0.0;
+
+            std::cout << "\nServer stats:\n";
+            std::cout << "Uptime: "<<uptime<<" seconds\n";
+            std::cout << "Total Requests: " << metrics.total_requests.load() <<"\n";
+            std::cout << "Active connections: " << metrics.active_connections.load() <<"\n";
+            std::cout << "Avg Throughput: " << avg_req_per_sec << "req/sec\n";
+        }
+        else if(command == "reset"){
+            metrics.total_requests = 0;
+            metrics.start_time = std::chrono::steady_clock::now();
+            std::cout << "Metrics reset complete.\n";
+        }
+        else if (!command.empty()) std::cout << "\nInvalid command. Available commands are: 'stats', 'reset', 'quit'.\n";
+    }
+
+    std::cout << "Initiating graceful shutdown...\n";
+    close(listener.listen_fd);
+    if(listener.thread_handle.joinable()) listener.thread_handle.join();
+
+    for (auto& worker : workers){
+        close(worker.epoll_fd);
+        if(worker.thread_handle.joinable()) worker.thread_handle.join(); 
+    }
+
+    std::cout << "Server shutdown completed.\n";
+    return 0;
+}
